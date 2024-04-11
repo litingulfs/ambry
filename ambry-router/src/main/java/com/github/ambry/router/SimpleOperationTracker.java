@@ -73,12 +73,15 @@ class SimpleOperationTracker implements OperationTracker {
   private static final Logger logger = LoggerFactory.getLogger(SimpleOperationTracker.class);
   protected final String datacenterName;
   protected final String originatingDcName;
-  protected final int replicaSuccessTarget;
+  protected final int localReplicaSuccessTarget;
+  protected int remoteReplicaSuccessTarget = 0;
   protected final int replicaParallelism;
+  protected final int remoteReplicaParallelism = -1; // TODO: paranoid durability
   // How many NotFound responses from originating dc will terminate the operation.
   protected final int originatingDcNotFoundFailureThreshold;
   protected final int totalReplicaCount;
   protected final LinkedList<ReplicaId> replicaPool = new LinkedList<>();
+  protected final Map<String, LinkedList<ReplicaId>> replicaPoolByDc = new HashMap<>();
   protected final NonBlockingRouterMetrics routerMetrics;
   private final OpTrackerIterator otIterator;
   private final RouterOperation routerOperation;
@@ -199,7 +202,7 @@ class SimpleOperationTracker implements OperationTracker {
     switch (routerOperation) {
       case GetBlobOperation:
       case GetBlobInfoOperation:
-        replicaSuccessTarget = routerConfig.routerGetSuccessTarget;
+        localReplicaSuccessTarget = routerConfig.routerGetSuccessTarget;
         replicaParallelism = routerConfig.routerGetRequestParallelism;
         crossColoEnabled = routerConfig.routerGetCrossDcEnabled;
         Map<ReplicaState, List<ReplicaId>> replicasByState = getReplicasByState(null,
@@ -214,22 +217,23 @@ class SimpleOperationTracker implements OperationTracker {
         break;
       case PutOperation:
         eligibleReplicas = getEligibleReplicas(datacenterName, EnumSet.of(ReplicaState.STANDBY, ReplicaState.LEADER));
-        replicaSuccessTarget =
+        localReplicaSuccessTarget =
             routerConfig.routerGetEligibleReplicasByStateEnabled ? Math.max(eligibleReplicas.size() - 1,
                 routerConfig.routerPutSuccessTarget) : routerConfig.routerPutSuccessTarget;
+        remoteReplicaSuccessTarget = routerConfig.routerPutRemoteSuccessTarget;
         replicaParallelism = routerConfig.routerGetEligibleReplicasByStateEnabled ? Math.min(eligibleReplicas.size(),
             routerConfig.routerPutRequestParallelism) : routerConfig.routerPutRequestParallelism;
         crossColoEnabled = false;
         break;
       case DeleteOperation:
-        replicaSuccessTarget = routerConfig.routerDeleteSuccessTarget;
+        localReplicaSuccessTarget = routerConfig.routerDeleteSuccessTarget;
         replicaParallelism = routerConfig.routerDeleteRequestParallelism;
         crossColoEnabled = true;
         eligibleReplicas =
             getEligibleReplicas(null, EnumSet.of(ReplicaState.BOOTSTRAP, ReplicaState.STANDBY, ReplicaState.LEADER));
         break;
       case TtlUpdateOperation:
-        replicaSuccessTarget = routerConfig.routerTtlUpdateSuccessTarget;
+        localReplicaSuccessTarget = routerConfig.routerTtlUpdateSuccessTarget;
         replicaParallelism = routerConfig.routerTtlUpdateRequestParallelism;
         crossColoEnabled = true;
         eligibleReplicas =
@@ -240,7 +244,7 @@ class SimpleOperationTracker implements OperationTracker {
         crossColoEnabled = true;
         eligibleReplicas =
             getEligibleReplicas(null, EnumSet.of(ReplicaState.BOOTSTRAP, ReplicaState.STANDBY, ReplicaState.LEADER));
-        replicaSuccessTarget = routerConfig.routerUndeleteSuccessTarget;
+        localReplicaSuccessTarget = routerConfig.routerUndeleteSuccessTarget;
         break;
       case ReplicateBlobOperation:
         // Replicate one blob. Unlike PutBlob, crossColoEnabled is true.
@@ -249,7 +253,7 @@ class SimpleOperationTracker implements OperationTracker {
         // b. Among the remote replicas, we randomly pick one. We don't pick the replication leader.
         eligibleReplicas =
             getEligibleReplicas(null, EnumSet.of(ReplicaState.STANDBY, ReplicaState.LEADER, ReplicaState.BOOTSTRAP));
-        replicaSuccessTarget = routerConfig.routerReplicateBlobSuccessTarget;
+        localReplicaSuccessTarget = routerConfig.routerReplicateBlobSuccessTarget;
         replicaParallelism = routerConfig.routerReplicateBlobRequestParallelism;
         crossColoEnabled = true;
         break;
@@ -287,7 +291,7 @@ class SimpleOperationTracker implements OperationTracker {
     this.otIterator = new OpTrackerIterator();
     logger.debug(
         "Router operation type: {}, successTarget = {}, parallelism = {}, originatingDcNotFoundFailureThreshold = {}, replicaPool = {}, originatingDC = {}",
-        routerOperation, replicaSuccessTarget, replicaParallelism, originatingDcNotFoundFailureThreshold, replicaPool,
+        routerOperation, localReplicaSuccessTarget, replicaParallelism, originatingDcNotFoundFailureThreshold, replicaPool,
         originatingDcName);
   }
 
@@ -436,7 +440,7 @@ class SimpleOperationTracker implements OperationTracker {
       int dynamicSuccessTarget = Math.max(totalReplicaCount - disabledCount - 1, routerConfig.routerPutSuccessTarget);
       hasSucceeded = replicaSuccessCount >= dynamicSuccessTarget;
     } else {
-      hasSucceeded = replicaSuccessCount >= replicaSuccessTarget;
+      hasSucceeded = replicaSuccessCount >= localReplicaSuccessTarget;
     }
     return hasSucceeded;
   }
@@ -544,8 +548,11 @@ class SimpleOperationTracker implements OperationTracker {
   @Override
   public Iterator<ReplicaId> getReplicaIterator() {
     replicaIterator = replicaPool.iterator();
+    // replicaByDcIterator will be a new iterator for the map
     return otIterator;
   }
+
+  // Create a new ParanoidDurabilityOpTracker that iterates through replicaByDcIterator
 
   private class OpTrackerIterator implements Iterator<ReplicaId> {
     @Override
@@ -689,7 +696,7 @@ class SimpleOperationTracker implements OperationTracker {
         logger.trace("RepairRequest: continue to run as long as we have replicas {}", blobId);
         return replicaInPoolOrFlightCount <= 0;
       } else {
-        return replicaInPoolOrFlightCount + replicaSuccessCount < replicaSuccessTarget;
+        return replicaInPoolOrFlightCount + replicaSuccessCount < localReplicaSuccessTarget;
       }
     }
   }
@@ -708,7 +715,7 @@ class SimpleOperationTracker implements OperationTracker {
    */
   private void addToBeginningOfPool(ReplicaId replicaId) {
     modifyReplicasInPoolOrInFlightCount(1);
-    replicaPool.addFirst(replicaId);
+    replicaPool.addFirst(replicaId); // TODO: paranoid durability - update to replicaPoolByDC
   }
 
   /**
@@ -732,7 +739,7 @@ class SimpleOperationTracker implements OperationTracker {
    * @return the success target number of this operation tracker for the provided replica type.
    */
   int getSuccessTarget() {
-    return replicaSuccessTarget;
+    return localReplicaSuccessTarget;
   }
 
   /**
