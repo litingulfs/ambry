@@ -1731,6 +1731,7 @@ class PutOperation {
         correlationIdToPutChunk.put(correlationId, this);
         requestRegistrationCallback.registerRequestToSend(PutOperation.this, requestInfo);
         replicaIterator.remove();
+
         if (RouterUtils.isRemoteReplica(routerConfig, replicaId)) {
           logger.debug("{}: Making request with correlationId {} to a remote replica {} in {}", loggingContext,
               correlationId, replicaId.getDataNodeId(), replicaId.getDataNodeId().getDatacenterName());

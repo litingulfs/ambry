@@ -76,6 +76,7 @@ class SimpleOperationTracker implements OperationTracker {
   protected final int localReplicaSuccessTarget;
   protected int remoteReplicaSuccessTarget = 0;
   protected final int replicaParallelism;
+  protected final int localReplicaParallelism;
   protected final int remoteReplicaParallelism = -1; // TODO: paranoid durability
   // How many NotFound responses from originating dc will terminate the operation.
   protected final int originatingDcNotFoundFailureThreshold;
@@ -88,7 +89,11 @@ class SimpleOperationTracker implements OperationTracker {
   private final PartitionId partitionId;
   private final RouterConfig routerConfig;
   protected int inflightCount = 0;
+  protected int localInflightCount = 0;
+  protected int remoteInflightCount = 0;
   protected int replicaSuccessCount = 0;
+  protected int localReplicaSuccessCount = 0;
+  protected int remoteReplicaSuccessCount = 0;
   protected List<ReplicaId> successReplica = new ArrayList<>();
   protected int replicaInPoolOrFlightCount = 0;
   protected int failedCount = 0;
@@ -97,6 +102,7 @@ class SimpleOperationTracker implements OperationTracker {
   protected int totalNotFoundCount = 0;
   protected ReplicaId lastReturnedByIterator = null;
   private Iterator<ReplicaId> replicaIterator;
+  private Iterator<ReplicaId> replicaByDcIterator;
   private final Set<ReplicaId> originatingDcLeaderOrStandbyReplicas;
   private final int originatingDcTotalReplicaCount;
   private final Map<ReplicaState, List<ReplicaId>> allDcReplicasByState;
@@ -223,6 +229,8 @@ class SimpleOperationTracker implements OperationTracker {
         remoteReplicaSuccessTarget = routerConfig.routerPutRemoteSuccessTarget;
         replicaParallelism = routerConfig.routerGetEligibleReplicasByStateEnabled ? Math.min(eligibleReplicas.size(),
             routerConfig.routerPutRequestParallelism) : routerConfig.routerPutRequestParallelism;
+        localReplicaParallelism = replicaParallelism;
+        remoteReplicaParallelism = routerConfig.routerPutRemoteRequestParallelism;
         crossColoEnabled = false;
         break;
       case DeleteOperation:
@@ -419,6 +427,95 @@ class SimpleOperationTracker implements OperationTracker {
     }
   }
 
+
+  private void paranoidDurabilityAddReplicasToPool(List<? extends ReplicaId> replicas, List<? extends ReplicaId> offlineReplicas,
+      boolean shuffleReplicas, boolean crossColoEnabled) {
+    LinkedList<ReplicaId> backupReplicas = new LinkedList<>();
+    LinkedList<ReplicaId> downReplicas = new LinkedList<>();
+    if (shuffleReplicas) {
+      Collections.shuffle(replicas);
+    }
+
+    // The priority here is local dc replicas, originating dc replicas, other dc replicas, down replicas.
+    // To improve read-after-write performance across DC, we prefer to take local and originating replicas only,
+    // which can be done by setting includeNonOriginatingDcReplicas False.
+    List<ReplicaId> examinedReplicas = new ArrayList<>();
+    int numLocalAndLiveReplicas = 0;
+    int numRemoteOriginatingDcAndLiveReplicas = 0;
+    for (ReplicaId replicaId : replicas) {
+      examinedReplicas.add(replicaId);
+      String replicaDcName = replicaId.getDataNodeId().getDatacenterName();
+      boolean isLocalDcReplica = replicaDcName.equals(datacenterName);
+      boolean isOriginatingDcReplica = replicaDcName.equals(originatingDcName);
+
+      if (!replicaId.isDown()) {
+        if (isLocalDcReplica) {
+          numLocalAndLiveReplicas++;
+          addToBeginningOfPool(replicaId);
+        } else if (crossColoEnabled && isOriginatingDcReplica) {
+          numRemoteOriginatingDcAndLiveReplicas++;
+          addToEndOfPool(replicaId);
+        } else if (crossColoEnabled) {
+          backupReplicas.addFirst(replicaId);
+        }
+      } else {
+        if (isLocalDcReplica) {
+          downReplicas.addFirst(replicaId);
+        } else if (crossColoEnabled) {
+          downReplicas.addLast(replicaId);
+        }
+      }
+    }
+    List<ReplicaId> backupReplicasToCheck = new ArrayList<>(backupReplicas);
+    List<ReplicaId> downReplicasToCheck = new ArrayList<>(downReplicas);
+
+    // Add replicas that are neither in local dc nor in originating dc.
+    backupReplicas.forEach(this::addToEndOfPool);
+
+    if (routerConfig.routerOperationTrackerIncludeDownReplicas) { // Paranoid durability: only run for get/getblobinfo
+      // Add those replicas deemed by native failure detector to be down
+      downReplicas.forEach(this::addToEndOfPool);
+      // Add those replicas deemed by Helix to be down (offline). This only applies to GET operation.
+      // Adding this logic to mitigate situation where one or more Zookeeper clusters are suddenly unavailable while
+      // ambry servers are still up.
+      if (routerOperation == RouterOperation.GetBlobOperation
+          || routerOperation == RouterOperation.GetBlobInfoOperation) {
+        List<ReplicaId> remoteOfflineReplicas = new ArrayList<>();
+        for (ReplicaId replica : offlineReplicas) {
+          if (replica.getDataNodeId().getDatacenterName().equals(datacenterName)) {
+            addToEndOfPool(replica);
+          } else {
+            remoteOfflineReplicas.add(replica);
+          }
+        }
+        remoteOfflineReplicas.forEach(this::addToEndOfPool);
+      }
+    }
+
+    // Paranoid durability: This is only run for GET
+    maybeDeprioritizeLocalBootstrapReplicas(numLocalAndLiveReplicas);
+
+    // Paranoid durability: This is only run for GET
+    maybeShuffleWithRemoteReplicas(numLocalAndLiveReplicas, numRemoteOriginatingDcAndLiveReplicas);
+
+    int replicaPoolSize = replicaPool.size();
+    // MockPartitionId.getReplicaIds() is returning a shared reference which may cause race condition.
+    // Please report the test failure if you run into this exception.
+    Supplier<IllegalArgumentException> notEnoughReplicasException = () -> new IllegalArgumentException(
+        generateErrorMessage(partitionId, examinedReplicas, replicaPool, backupReplicasToCheck, downReplicasToCheck,
+            routerOperation));
+    possibleRunOfflineRepair = possibleRunOfflineRepair(replicaPoolSize);
+    if (replicaPoolSize < getSuccessTarget()) {
+      if (possibleRunOfflineRepair) {
+        logger.info("RepairRequest: Not enough quorum for delete but give it a try since offline repair is enabled {}",
+            blobId);
+      } else {
+        // Paranoid durability: Need to check that we have enough replicas in EACH data center.
+        throw notEnoughReplicasException.get(); // Paranoid durability - consider moving the notenoughreplicasexception here to clean up
+      }
+    }
+  }
+
   /**
    * The dynamic success target is introduced mainly for following use case:
    * In the intermediate state of "move replica", when decommission of old replicas is initiated(but hasn't transited to
@@ -441,6 +538,18 @@ class SimpleOperationTracker implements OperationTracker {
       hasSucceeded = replicaSuccessCount >= dynamicSuccessTarget;
     } else {
       hasSucceeded = replicaSuccessCount >= localReplicaSuccessTarget;
+    }
+    return hasSucceeded;
+  }
+
+  public boolean hasSucceededParanoidDurability() {
+    boolean hasSucceeded;
+    if (routerOperation == RouterOperation.PutOperation && routerConfig.routerPutUseDynamicSuccessTarget) {
+      // this logic only applies to replicas where the quorum can change during replica movement
+      int dynamicSuccessTarget = Math.max(totalReplicaCount - disabledCount - 1, routerConfig.routerPutSuccessTarget);
+      hasSucceeded = replicaSuccessCount >= dynamicSuccessTarget; // What do we do here for paranoid durability? TODO for now.
+    } else {
+      hasSucceeded = (localReplicaSuccessCount >= localReplicaSuccessTarget) && (remoteReplicaSuccessCount >= remoteReplicaSuccessTarget);
     }
     return hasSucceeded;
   }
@@ -511,10 +620,50 @@ class SimpleOperationTracker implements OperationTracker {
 
   @Override
   public void onResponse(ReplicaId replicaId, TrackedRequestFinalState trackedRequestFinalState) {
-    inflightCount--;
+    inflightCount--; // paranoid durability - decrement the right counter based on whether or not replicaid is local
     // once a response has been received, a replica is no longer in the pool or currently in flight.
     modifyReplicasInPoolOrInFlightCount(-1);
     switch (trackedRequestFinalState) {
+      case SUCCESS:
+        successReplica.add(replicaId);
+        replicaSuccessCount++;
+        break;
+      // Request disabled may happen when PUT/DELETE/TTLUpdate requests attempt to perform on replicas that are being
+      // decommissioned (i.e STANDBY -> INACTIVE). This is because decommission may take some time and frontends still
+      // hold old view. Aforementioned requests are rejected by server with Temporarily_Disabled error. For DELETE/TTLUpdate,
+      // even though we may receive such errors, the success target is still same(=2). For PUT, we have to adjust the
+      // success target (quorum) to let some PUT operations (with at least 2 requests succeeded on new replicas) succeed.
+      // Currently, disabledCount only applies to PUT operation.
+      case REQUEST_DISABLED:
+        disabledCount++;
+        break;
+      default:
+        failedCount++;
+        // NOT_FOUND is a special error. When tracker sees >= numReplicasInOriginatingDc - 1 "NOT_FOUND" from the
+        // originating DC, we can be sure the operation will end up with a NOT_FOUND error.
+        if (trackedRequestFinalState == TrackedRequestFinalState.NOT_FOUND) {
+          totalNotFoundCount++;
+          if (replicaId.getDataNodeId().getDatacenterName().equals(originatingDcName)) {
+            if (originatingDcLeaderOrStandbyReplicas.contains(replicaId)) {
+              // Since bootstrap replicas could still be catching up, treat NotFound responses only from leader or
+              // standby replicas as valid.
+              originatingDcNotFoundCount++;
+            }
+          }
+        }
+    }
+  }
+
+  public void onResponseParanoidDurability(ReplicaId replicaId, TrackedRequestFinalState trackedRequestFinalState) {
+    if(replicaId.getDataNodeId().getDatacenterName().equals(datacenterName)) {
+      localInflightCount--;
+    } else {
+      remoteInflightCount--;
+    }
+
+    // Paranoid durability - this counter is only used for offline repair so we can ignore it
+    modifyReplicasInPoolOrInFlightCount(-1);
+    switch (trackedRequestFinalState) { // Paranoid durability - do we need to consider this switch block at all?
       case SUCCESS:
         successReplica.add(replicaId);
         replicaSuccessCount++;
@@ -574,6 +723,50 @@ class SimpleOperationTracker implements OperationTracker {
       lastReturnedByIterator = replicaIterator.next();
       return lastReturnedByIterator;
     }
+  }
+
+  private class ParanoidDurabilityTrackerIterator implements Iterator<ReplicaId> {
+
+    @Override
+    public boolean hasNext() {
+        return hasNextLocal() || hasNextRemote();
+    }
+
+    @Override
+    public void remove() {
+      if(lastReturnedByIterator.getDataNodeId().getDatacenterName().equals(datacenterName)) {
+        localInflightCount++;
+        localReplicaIterator.remove();
+      } else {
+        remoteInflightCount++;
+        remoteReplicaIterator.remove();
+      }
+    }
+
+    @Override
+    public ReplicaId next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
+      }
+
+      if(hasNextLocal()) {
+        lastReturnedByIterator = localReplicaIterator.next();
+        return lastReturnedByIterator;
+      }
+
+      if(hasNextRemote() {
+        lastReturnedByIterator = remoteReplicaIterator.next();
+        return lastReturnedByIterator;
+      }
+    }
+
+      private boolean hasNextLocal() {
+          return localInflightCount < getCurrentLocalParallelism() && localReplicaIterator.hasNext();
+      }
+
+      private boolean hasNextRemote() {
+          return remoteInflightCount < getCurrentRemoteParallelism() && remoteReplicaIterator.hasNext()
+      }
   }
 
   /**
@@ -659,7 +852,7 @@ class SimpleOperationTracker implements OperationTracker {
           routerOperation, numLocalAndLiveReplicas, partitionId);
       routerMetrics.shuffledWithRemoteReplicasForGetDueToFewLocalReplicas.inc();
       List<ReplicaId> replicasToReshuffle = new ArrayList<>();
-      if (numRemoteOriginatingDcAndLiveReplicas > 0) {
+      if (numRemoteOriginatingDcAndLiveReplicas > 0) { // TODO: paranoid durability - need to consider if we need to change this (only applies to GET/TTLUpdate/DELETE)
         // If the local DC is not the originating DC, we shuffle only with originating DC replicas.
         replicasToReshuffle.addAll(
             replicaPool.subList(0, numLocalAndLiveReplicas + numRemoteOriginatingDcAndLiveReplicas));
@@ -680,7 +873,7 @@ class SimpleOperationTracker implements OperationTracker {
 
   public boolean hasFailed() {
     if (routerOperation == RouterOperation.PutOperation && routerConfig.routerPutUseDynamicSuccessTarget) {
-      return totalReplicaCount - failedCount < Math.max(totalReplicaCount - 1,
+      return totalReplicaCount - failedCount < Math.max(totalReplicaCount - 1, // TODO for paranoid durability, maybeLeave this until later
           routerConfig.routerPutSuccessTarget + disabledCount);
     } else {
       // If blob is not found in originating DC, we can terminate the operation early. Adding
@@ -696,6 +889,32 @@ class SimpleOperationTracker implements OperationTracker {
         logger.trace("RepairRequest: continue to run as long as we have replicas {}", blobId);
         return replicaInPoolOrFlightCount <= 0;
       } else {
+        // Paranoid durability need to check for the remote success target also
+        return replicaInPoolOrFlightCount + replicaSuccessCount < localReplicaSuccessTarget;
+      }
+    }
+  }
+
+  public boolean hasFailedParanoidDurability() {
+    if (routerOperation == RouterOperation.PutOperation && routerConfig.routerPutUseDynamicSuccessTarget) {
+      return totalReplicaCount - failedCount < Math.max(totalReplicaCount - 1,
+          routerConfig.routerPutSuccessTarget + disabledCount); // Paranoid durability: Do we need to consider this block?
+    } else {
+      // If blob is not found in originating DC, we can terminate the operation early. Adding
+      // routerConfig.routerOperationTrackerTerminateOnNotFoundEnabled as a safe guard to search replicas in all colos
+      // before terminating the operation.
+      if (routerConfig.routerOperationTrackerTerminateOnNotFoundEnabled && hasFailedOnNotFound()) {
+        return true;
+      }
+      // if there is no possible way to use the remaining replicas to meet the success target,
+      // deem the operation a failure.
+      // For Delete, even there is not enough quorum, if offline repair is enabled, continue to run it.
+      if (possibleRunOfflineRepair) {
+        logger.trace("RepairRequest: continue to run as long as we have replicas {}", blobId);
+        return replicaInPoolOrFlightCount <= 0; // Paranoid durability: What is this variable and do we need to change it?
+      } else {
+        // Paranoid durability: Do we need a new block here that checks if this is a PutOperation and also if
+        // paranoid durability is enabled? Note that replicaInPoolOrFlightCount is incremented in modifyReplicasInPoolOrInFlightCount()
         return replicaInPoolOrFlightCount + replicaSuccessCount < localReplicaSuccessTarget;
       }
     }
@@ -716,6 +935,8 @@ class SimpleOperationTracker implements OperationTracker {
   private void addToBeginningOfPool(ReplicaId replicaId) {
     modifyReplicasInPoolOrInFlightCount(1);
     replicaPool.addFirst(replicaId); // TODO: paranoid durability - update to replicaPoolByDC
+    replicaPoolByDc.computeIfAbsent(replicaId.getDataNodeId().getDatacenterName(), k -> new LinkedList<>())
+        .addFirst(replicaId);
   }
 
   /**
@@ -725,6 +946,8 @@ class SimpleOperationTracker implements OperationTracker {
   private void addToEndOfPool(ReplicaId replicaId) {
     modifyReplicasInPoolOrInFlightCount(1);
     replicaPool.addLast(replicaId);
+    replicaPoolByDc.computeIfAbsent(replicaId.getDataNodeId().getDatacenterName(), k -> new LinkedList<>())
+        .addLast(replicaId);
   }
 
   /**
@@ -747,9 +970,11 @@ class SimpleOperationTracker implements OperationTracker {
    * first replica in the pool if this is the first request sent.
    * @return the parallelism setting to honor.
    */
-  int getCurrentParallelism() {
-    return replicaParallelism;
-  }
+  int getCurrentParallelism() { return replicaParallelism; }
+
+  int getCurrentLocalParallelism() { return localReplicaParallelism; }
+
+  int getCurrentRemoteParallelism() { return remoteReplicaParallelism; }
 
   /**
    * @return the number of requests that are temporarily disabled on certain replicas.
