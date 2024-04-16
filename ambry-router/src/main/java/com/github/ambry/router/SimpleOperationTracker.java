@@ -427,7 +427,8 @@ class SimpleOperationTracker implements OperationTracker {
     }
   }
 
-
+  // Note that the replica list that is input to this method needs to have all the eligible replicas from all the
+  // data centers, not just the local one.
   private void paranoidDurabilityAddReplicasToPool(List<? extends ReplicaId> replicas, List<? extends ReplicaId> offlineReplicas,
       boolean shuffleReplicas, boolean crossColoEnabled) {
     LinkedList<ReplicaId> backupReplicas = new LinkedList<>();
@@ -459,8 +460,8 @@ class SimpleOperationTracker implements OperationTracker {
           backupReplicas.addFirst(replicaId);
         }
       } else {
-        if (isLocalDcReplica) {
-          downReplicas.addFirst(replicaId);
+        if (isLocalDcReplica) {             // Paranoid durability: I think this should just work since we changed
+          downReplicas.addFirst(replicaId); // addToBeginningOfPool() and addToEndOfPool().
         } else if (crossColoEnabled) {
           downReplicas.addLast(replicaId);
         }
