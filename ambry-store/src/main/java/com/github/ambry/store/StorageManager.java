@@ -147,6 +147,10 @@ public class StorageManager implements StoreManager {
       diskToReplicaMap.computeIfAbsent(disk, key -> new ArrayList<>()).add(replica);
       partitionNameToReplicaId.put(replica.getPartitionId().toPathString(), replica);
     }
+    // Assume it's safe to place the new code here, AFTER partitionNameToReplicaId is populated.
+    ReplicaPlacementChecker placementChecker = new ReplicaPlacementChecker(diskToReplicaMap);
+    placementChecker.checkReplicaPlacement();
+
     for (Map.Entry<DiskId, List<ReplicaId>> entry : diskToReplicaMap.entrySet()) {
       DiskId disk = entry.getKey();
       List<ReplicaId> replicasForDisk = entry.getValue();
